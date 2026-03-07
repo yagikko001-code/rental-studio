@@ -527,23 +527,81 @@ elif page == "📥 データ取込":
     st.subheader("🏦 銀行振込 入金確認")
 
     md = st.session_state.master_data
+    # 既存データに新カラムがない場合はデフォルト値で補完
+    if not md.empty:
+        if "入金額" not in md.columns:
+            md["入金額"] = md.apply(lambda r: r["実売上"] if r.get("確認済み", False) else 0.0, axis=1)
+        if "入金ステータス" not in md.columns:
+            md["入金ステータス"] = md.apply(
+                lambda r: "入金済み" if r.get("確認済み", False) else "未入金", axis=1
+            )
+        st.session_state.master_data = md
+
     if not md.empty and "確認済み" in md.columns:
         pending = md[(md["確認済み"] == False) & (md["データ種別"] == "CSV")]
         if pending.empty:
             st.success("未確認の銀行振込はありません")
         else:
             st.warning(f"入金確認待ち: {len(pending)} 件")
-            show_cols = [c for c in ["予約ID", "月", "利用日", "顧客名", "店舗",
-                                      "決済方法", "実売上"] if c in pending.columns]
-            for idx, row in pending[show_cols + ["予約ID"]].iterrows():
-                c1, c2, c3 = st.columns([3, 2, 1])
+            for idx, row in pending.iterrows():
+                c1, c2 = st.columns([4, 2])
                 with c1:
-                    st.text(f"予約ID: {row.get('予約ID','')}  顧客: {row.get('顧客名','')}  店舗: {row.get('店舗','')}")
+                    st.text(f"予約ID: {row.get('予約ID','')}　顧客: {row.get('顧客名','')}　店舗: {row.get('店舗','')}")
                 with c2:
-                    st.text(f"{row.get('月','')}  {fmt_yen(row.get('実売上', 0))}")
+                    st.text(f"{row.get('月','')}　売上: {fmt_yen(row.get('実売上', 0))}")
+
+                with st.expander(f"入金確認・金額編集　予約ID: {row.get('予約ID','')}", expanded=False):
+                    ec1, ec2, ec3 = st.columns(3)
+                    with ec1:
+                        deposit = st.number_input(
+                            "実際の入金額（円）", min_value=0, step=100,
+                            value=int(row.get("入金額", 0)),
+                            key=f"md_dep_{idx}",
+                        )
+                    with ec2:
+                        deposit_status = st.selectbox(
+                            "入金ステータス",
+                            ["未入金", "入金済み", "金額不一致", "未入金（督促済み）"],
+                            index=0, key=f"md_status_{idx}",
+                        )
+                    with ec3:
+                        deposit_date = st.date_input("入金日", value=datetime.now().date(), key=f"md_depdate_{idx}")
+
+                    diff = deposit - row.get("実売上", 0)
+                    if diff != 0 and deposit > 0:
+                        st.info(f"売上額との差額: {fmt_yen(diff)}")
+
+                    if st.button("✅ 入金確認して保存", key=f"confirm_{idx}"):
+                        st.session_state.master_data.at[idx, "入金額"] = float(deposit)
+                        st.session_state.master_data.at[idx, "入金ステータス"] = deposit_status
+                        st.session_state.master_data.at[idx, "支払日"] = pd.Timestamp(deposit_date)
+                        if deposit_status == "入金済み":
+                            st.session_state.master_data.at[idx, "確認済み"] = True
+                            st.session_state.master_data.at[idx, "手取り"] = float(deposit)
+                        else:
+                            st.session_state.master_data.at[idx, "確認済み"] = False
+                        save_state()
+                        _rebuild_cache()
+                        st.rerun()
+
+        # ── 確認済み銀行振込の確認取消・金額修正 ──
+        confirmed_bank = md[(md["確認済み"] == True) & (md["データ種別"] == "CSV") & (md["決済方法"].str.contains("銀行", na=False))]
+        if not confirmed_bank.empty:
+            st.divider()
+            st.subheader(f"🟢 入金確認済みの銀行振込 ({len(confirmed_bank)} 件)")
+            for idx, row in confirmed_bank.iterrows():
+                c1, c2, c3 = st.columns([3, 3, 1])
+                with c1:
+                    st.text(f"予約ID: {row.get('予約ID','')}　顧客: {row.get('顧客名','')}")
+                diff = row.get("入金額", row["実売上"]) - row["実売上"]
+                diff_text = f"　差額: {fmt_yen(diff)}" if diff != 0 else ""
+                with c2:
+                    st.text(f"売上: {fmt_yen(row['実売上'])} → 入金: {fmt_yen(row.get('入金額', row['実売上']))}{diff_text}")
                 with c3:
-                    if st.button("✅ 入金確認", key=f"confirm_{idx}"):
-                        st.session_state.master_data.at[idx, "確認済み"] = True
+                    if st.button("↩️ 確認取消", key=f"md_unconfirm_{idx}"):
+                        st.session_state.master_data.at[idx, "確認済み"] = False
+                        st.session_state.master_data.at[idx, "入金ステータス"] = "未入金"
+                        st.session_state.master_data.at[idx, "支払日"] = pd.NaT
                         save_state()
                         _rebuild_cache()
                         st.rerun()
