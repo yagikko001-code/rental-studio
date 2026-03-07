@@ -619,12 +619,14 @@ elif page == "📄 請求書管理":
                     "割引":           0.0,
                     "返金":           0.0,
                     "実売上":         float(inv_amount),
+                    "入金額":         0.0,
                     "手数料率":       0.0,
                     "手数料":         0.0,
                     "手取り":         float(inv_amount),
                     "プラットフォーム": "請求書",
                     "データ種別":     "請求書",
                     "確認済み":       False,
+                    "入金ステータス": "未入金",
                     "備考":           inv_note,
                 }])
                 existing_inv = st.session_state.invoice_data
@@ -645,32 +647,128 @@ elif page == "📄 請求書管理":
 
     with tab_list:
         inv = st.session_state.invoice_data
+        # 既存データに新カラムがない場合はデフォルト値で補完
+        if not inv.empty:
+            if "入金額" not in inv.columns:
+                inv["入金額"] = inv.apply(lambda r: r["実売上"] if r.get("確認済み", False) else 0.0, axis=1)
+            if "入金ステータス" not in inv.columns:
+                inv["入金ステータス"] = inv.apply(
+                    lambda r: "入金済み" if r.get("確認済み", False) else "未入金", axis=1
+                )
+            st.session_state.invoice_data = inv
+
         if inv.empty:
             st.info("請求書データがありません。「請求書登録」タブから追加してください。")
         else:
-            # ── 未確認一覧 ──
+            # ── 未入金一覧 ──
             pending_inv = inv[inv["確認済み"] == False]
             if not pending_inv.empty:
                 st.subheader(f"🔴 入金未確認 ({len(pending_inv)} 件)")
                 for idx, row in pending_inv.iterrows():
-                    c1, c2, c3, c4 = st.columns([2, 2, 2, 1])
-                    c1.write(f"**{row['請求書番号']}**  {row['顧客名']}")
-                    c2.write(f"店舗: {row['店舗']}  月: {row['月']}")
-                    c3.write(f"金額: {fmt_yen(row['実売上'])}")
-                    with c4:
-                        if st.button("✅ 入金確認", key=f"inv_confirm_{idx}"):
-                            st.session_state.invoice_data.at[idx, "確認済み"] = True
-                            st.session_state.invoice_data.at[idx, "支払日"] = pd.Timestamp(datetime.now().date())
+                    c1, c2, c3 = st.columns([3, 2, 2])
+                    c1.write(f"**{row['請求書番号']}**　{row['顧客名']}")
+                    c2.write(f"店舗: {row['店舗']}　月: {row['月']}")
+                    c3.write(f"請求額: {fmt_yen(row['実売上'])}")
+
+                    with st.expander(f"入金確認・編集　{row['請求書番号']}", expanded=False):
+                        ec1, ec2 = st.columns(2)
+                        with ec1:
+                            deposit = st.number_input(
+                                "入金額（円）", min_value=0, step=100,
+                                value=int(row.get("入金額", 0)),
+                                key=f"inv_dep_{idx}",
+                            )
+                        with ec2:
+                            deposit_status = st.selectbox(
+                                "入金ステータス",
+                                ["未入金", "入金済み", "金額不一致", "未入金（督促済み）"],
+                                index=0, key=f"inv_status_{idx}",
+                            )
+                        deposit_date = st.date_input("入金日", value=datetime.now().date(), key=f"inv_depdate_{idx}")
+
+                        if st.button("✅ 入金確認して保存", key=f"inv_confirm_{idx}"):
+                            st.session_state.invoice_data.at[idx, "入金額"] = float(deposit)
+                            st.session_state.invoice_data.at[idx, "入金ステータス"] = deposit_status
+                            st.session_state.invoice_data.at[idx, "支払日"] = pd.Timestamp(deposit_date)
+                            if deposit_status == "入金済み":
+                                st.session_state.invoice_data.at[idx, "確認済み"] = True
+                                st.session_state.invoice_data.at[idx, "手取り"] = float(deposit)
+                            else:
+                                st.session_state.invoice_data.at[idx, "確認済み"] = False
                             save_state()
                             _rebuild_cache()
                             st.rerun()
 
+            # ── 確認済み一覧 ──
+            confirmed_inv = inv[inv["確認済み"] == True]
+            if not confirmed_inv.empty:
+                st.divider()
+                st.subheader(f"🟢 入金確認済み ({len(confirmed_inv)} 件)")
+                for idx, row in confirmed_inv.iterrows():
+                    c1, c2, c3, c4 = st.columns([3, 2, 2, 2])
+                    c1.write(f"**{row['請求書番号']}**　{row['顧客名']}")
+                    c2.write(f"店舗: {row['店舗']}　月: {row['月']}")
+                    diff = row.get("入金額", row["実売上"]) - row["実売上"]
+                    diff_text = f"（差額: {fmt_yen(diff)}）" if diff != 0 else ""
+                    c3.write(f"請求: {fmt_yen(row['実売上'])} → 入金: {fmt_yen(row.get('入金額', row['実売上']))}{diff_text}")
+                    with c4:
+                        if st.button("↩️ 確認取消", key=f"inv_unconfirm_{idx}"):
+                            st.session_state.invoice_data.at[idx, "確認済み"] = False
+                            st.session_state.invoice_data.at[idx, "入金ステータス"] = "未入金"
+                            st.session_state.invoice_data.at[idx, "支払日"] = pd.NaT
+                            save_state()
+                            _rebuild_cache()
+                            st.rerun()
+
+            # ── 請求書の編集 ──
+            st.divider()
+            st.subheader("✏️ 請求書を編集")
+            edit_options = inv["請求書番号"].tolist()
+            selected_inv = st.selectbox("編集する請求書を選択", edit_options, key="edit_inv_select")
+            if selected_inv:
+                edit_idx = inv[inv["請求書番号"] == selected_inv].index[0]
+                edit_row = inv.loc[edit_idx]
+
+                with st.form(key=f"edit_form_{edit_idx}"):
+                    fc1, fc2, fc3 = st.columns(3)
+                    with fc1:
+                        new_store = st.selectbox("店舗", st.session_state.stores,
+                                                 index=st.session_state.stores.index(edit_row["店舗"]) if edit_row["店舗"] in st.session_state.stores else 0)
+                    with fc2:
+                        new_month = st.selectbox("対象月", MONTH_OPTIONS,
+                                                 index=MONTH_OPTIONS.index(edit_row["月"]) if edit_row["月"] in MONTH_OPTIONS else 0)
+                    with fc3:
+                        new_customer = st.text_input("顧客名", value=edit_row["顧客名"])
+
+                    fc4, fc5 = st.columns(2)
+                    with fc4:
+                        new_amount = st.number_input("請求金額（円）", min_value=0, step=100, value=int(edit_row["実売上"]))
+                    with fc5:
+                        new_note = st.text_input("備考", value=edit_row.get("備考", "") or "")
+
+                    if st.form_submit_button("💾 変更を保存"):
+                        st.session_state.invoice_data.at[edit_idx, "店舗"] = new_store
+                        st.session_state.invoice_data.at[edit_idx, "月"] = new_month
+                        st.session_state.invoice_data.at[edit_idx, "顧客名"] = new_customer
+                        st.session_state.invoice_data.at[edit_idx, "売上"] = float(new_amount)
+                        st.session_state.invoice_data.at[edit_idx, "実売上"] = float(new_amount)
+                        st.session_state.invoice_data.at[edit_idx, "手取り"] = float(new_amount) if not edit_row["確認済み"] else edit_row.get("入金額", float(new_amount))
+                        st.session_state.invoice_data.at[edit_idx, "備考"] = new_note
+                        save_state()
+                        _rebuild_cache()
+                        st.success("✅ 請求書を更新しました")
+                        st.rerun()
+
+            # ── 全請求書一覧テーブル ──
             st.divider()
             st.subheader("📋 全請求書一覧")
-            show_cols = [c for c in ["請求書番号", "月", "店舗", "顧客名", "実売上", "確認済み", "備考"]
+            show_cols = [c for c in ["請求書番号", "月", "店舗", "顧客名", "実売上", "入金額", "入金ステータス", "確認済み", "備考"]
                          if c in inv.columns]
+            fmt_dict = {"実売上": fmt_yen}
+            if "入金額" in inv.columns:
+                fmt_dict["入金額"] = fmt_yen
             st.dataframe(
-                inv[show_cols].style.format({"実売上": fmt_yen}),
+                inv[show_cols].style.format(fmt_dict),
                 use_container_width=True,
             )
 
